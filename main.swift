@@ -2,24 +2,23 @@ import Cocoa
 import CoreGraphics
 
 // ============================================================================
-//  ScalePlanRuler
-//  A floating, always-on-top screen ruler (in the spirit of Free Ruler) that
-//  reads out real-world dimensions for on-screen PDF plans.
+//  DesktopScaleRuler — floating screen ruler for on-screen PDF plans.
 //
-//  Scale model:
-//    The ruler measures a span in screen points. One factor — mmPerPoint —
-//    converts that to real-world millimetres.
-//
-//    • CALIBRATE: stretch the ruler over a known dimension, type its real
-//      length. Reliable at any zoom.
-//    • PRESETS (1:100 / 1:50 / custom): computed from this display's real
-//      physical size, so they are correct when the PDF is shown at Preview's
-//      "Actual Size".
+//  • CALIBRATE: stretch the ruler over a known dimension, type its real length.
+//  • PRESETS (1:100 / 1:50 / custom): computed from the display's real physical
+//    size, correct at Preview "Actual Size". Run "Calibrate Display" once for
+//    perfect accuracy.
+//  • MEASURE MODES: Ruler (default), Distance (two points + angle), Area (m²).
+//  Settings persist between launches.
 // ============================================================================
 
 let FALLBACK_MM_PER_POINT = 25.4 / 108.0
 
+/// User-set true physical mm-per-point for this display (from Calibrate Display).
+var displayOverrideMMPerPoint: Double?
+
 func physMMPerPoint(for screen: NSScreen?) -> Double {
+    if let o = displayOverrideMMPerPoint, o > 0 { return o }
     guard let screen = screen,
           let num = screen.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as? NSNumber
     else { return FALLBACK_MM_PER_POINT }
@@ -29,6 +28,8 @@ func physMMPerPoint(for screen: NSScreen?) -> Double {
     guard mm.width > 0, pts > 0 else { return FALLBACK_MM_PER_POINT }
     return Double(mm.width) / Double(pts)
 }
+
+enum MeasureMode { case ruler, distance, area }
 
 // MARK: - Shared model -------------------------------------------------------
 
@@ -40,6 +41,8 @@ final class RulerModel {
     var useMetres: Bool = false
     var showGuide: Bool = true
     var showLeadLines: Bool = true
+    var calibrated: Bool = false       // true if set from a known dimension
+    var mode: MeasureMode = .ruler
 
     var onChange: (() -> Void)?
     func notify() { onChange?() }
@@ -55,10 +58,16 @@ final class RulerModel {
     var scaleLabel: String { String(format: "1:%g", scaleRatio) }
 }
 
-// MARK: - Ruler window -------------------------------------------------------
+// MARK: - Windows ------------------------------------------------------------
 
 final class RulerPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+final class OverlayWindow: NSWindow {
+    var interactive = false
+    override var canBecomeKey: Bool { interactive }
     override var canBecomeMain: Bool { false }
 }
 
@@ -96,8 +105,7 @@ final class RulerView: NSView {
         let bg = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
         NSColor(calibratedRed: 0.0, green: 0.48, blue: 0.95, alpha: 0.95).setFill(); bg.fill()
         let s = NSAttributedString(string: "\(RulerModel.shared.scaleLabel)  ⤢", attributes: [
-            .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white
-        ])
+            .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white])
         let sz = s.size()
         s.draw(at: NSPoint(x: bounds.midX - sz.width / 2, y: bounds.midY - sz.height / 2))
     }
@@ -128,8 +136,7 @@ final class RulerView: NSView {
         guard stepPts > 3 else { return }
 
         let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.black
-        ]
+            .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.black]
 
         NSColor(calibratedWhite: 0.5, alpha: 0.8).setStroke()
         let minorStep = stepPts / 5.0
@@ -160,7 +167,6 @@ final class RulerView: NSView {
                 p.move(to: NSPoint(x: bounds.width, y: d)); p.line(to: NSPoint(x: bounds.width - t, y: d))
             }
             p.lineWidth = 1; p.stroke()
-
             let s = NSAttributedString(string: labelString(Double(i) * majorMM), attributes: textAttrs)
             let sz = s.size()
             if horiz {
@@ -183,15 +189,16 @@ final class RulerView: NSView {
         }
     }
 
-    // Measurement on top, scale stacked below — keeps the readout narrow so a
-    // short ruler stays readable.
     private func drawReadout() {
         let model = RulerModel.shared
         let horiz = orientation == .horizontal
         let lengthPts = horiz ? bounds.width : bounds.height
         let bgw = NSColor(calibratedWhite: 1, alpha: 0.7)
+        let mainColor: NSColor = model.calibrated
+            ? NSColor(calibratedRed: 0.0, green: 0.45, blue: 0.1, alpha: 1)   // calibrated = green
+            : NSColor.black                                                    // nominal preset
         let line1 = NSAttributedString(string: model.formatted(points: lengthPts), attributes: [
-            .font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: NSColor.black, .backgroundColor: bgw])
+            .font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: mainColor, .backgroundColor: bgw])
         let line2 = NSAttributedString(string: model.scaleLabel, attributes: [
             .font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.darkGray, .backgroundColor: bgw])
         let s1 = line1.size(), s2 = line2.size()
@@ -233,8 +240,7 @@ final class RulerView: NSView {
         var f = initialFrame
         switch dragMode {
         case .move:
-            f.origin.x = initialFrame.origin.x + dx
-            f.origin.y = initialFrame.origin.y + dy
+            f.origin.x = initialFrame.origin.x + dx; f.origin.y = initialFrame.origin.y + dy
         case .resizeStart:
             if orientation == .horizontal {
                 let w = max(minLen, initialFrame.width - dx)
@@ -255,19 +261,100 @@ final class RulerView: NSView {
     override func mouseUp(with event: NSEvent) { dragMode = .none }
 }
 
-// MARK: - Full-screen overlay (lead lines + live cursor guide) ---------------
+// MARK: - Overlay (lead lines, cursor guide, distance & area modes) ----------
 
 final class OverlayView: NSView {
     weak var rulerWindow: NSWindow?
     weak var rulerView: RulerView?
     var originOffset: NSPoint = .zero
     var cursorScreen: NSPoint = .zero
+    var pts: [NSPoint] = []          // screen-coord points for distance/area
+    var areaClosed = false
 
     override var isFlipped: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
     private func toView(_ p: NSPoint) -> NSPoint { NSPoint(x: p.x - originOffset.x, y: p.y - originOffset.y) }
+    private func screenPoint(_ e: NSEvent) -> NSPoint {
+        NSPoint(x: originOffset.x + e.locationInWindow.x, y: originOffset.y + e.locationInWindow.y)
+    }
+
+    override func mouseDown(with e: NSEvent) {
+        let mode = RulerModel.shared.mode
+        guard mode != .ruler else { return }
+        if e.clickCount >= 2 {
+            if mode == .area && pts.count >= 3 { areaClosed = true }
+            needsDisplay = true; return
+        }
+        let p = screenPoint(e)
+        switch mode {
+        case .distance: if pts.count >= 2 { pts = [p] } else { pts.append(p) }
+        case .area:     if areaClosed { pts = []; areaClosed = false }; pts.append(p)
+        case .ruler:    break
+        }
+        needsDisplay = true
+    }
+
+    override func mouseMoved(with e: NSEvent) { cursorScreen = NSEvent.mouseLocation; needsDisplay = true }
+
+    override func keyDown(with e: NSEvent) {
+        switch e.keyCode {
+        case 53: pts.removeAll(); areaClosed = false; needsDisplay = true
+        case 36, 76: if RulerModel.shared.mode == .area && pts.count >= 3 { areaClosed = true; needsDisplay = true }
+        default: super.keyDown(with: e)
+        }
+    }
+
+    func distanceText() -> String? {
+        guard pts.count >= 1 else { return nil }
+        let a = pts[0]; let b = pts.count >= 2 ? pts[1] : cursorScreen
+        let dist = CGFloat(hypot(Double(b.x - a.x), Double(b.y - a.y)))
+        let ang = atan2(Double(b.y - a.y), Double(b.x - a.x)) * 180 / Double.pi
+        return "\(RulerModel.shared.formatted(points: dist))  \(String(format: "%.1f°", abs(ang)))"
+    }
+
+    func areaText() -> String? {
+        let poly = pts
+        guard poly.count >= 3 else { return nil }
+        let aPts = OverlayView.polygonArea(poly)
+        let mpp = RulerModel.shared.mmPerPoint
+        let m2 = Double(aPts) * mpp * mpp / 1_000_000.0
+        return String(format: "%.2f m²", m2)
+    }
+
+    static func polygonArea(_ p: [NSPoint]) -> CGFloat {
+        guard p.count >= 3 else { return 0 }
+        var s: CGFloat = 0
+        for i in 0..<p.count { let j = (i + 1) % p.count; s += p[i].x * p[j].y - p[j].x * p[i].y }
+        return abs(s) / 2
+    }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let rw = rulerWindow, let rv = rulerView, !rv.collapsed else { return }
+        guard let rw = rulerWindow, let rv = rulerView else { return }
+        switch RulerModel.shared.mode {
+        case .ruler:    drawRulerGuides(rw, rv)
+        case .distance: drawDistance()
+        case .area:     drawArea()
+        }
+    }
+
+    private func label(_ text: String, at p: NSPoint, color: NSColor) {
+        let s = NSAttributedString(string: " \(text) ", attributes: [
+            .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white, .backgroundColor: color])
+        let sz = s.size()
+        var lx = p.x + 8, ly = p.y + 8
+        lx = min(max(2, lx), bounds.width - sz.width - 2)
+        ly = min(max(2, ly), bounds.height - sz.height - 2)
+        s.draw(at: NSPoint(x: lx, y: ly))
+    }
+
+    private func dot(_ p: NSPoint, _ color: NSColor) {
+        color.setFill()
+        NSBezierPath(ovalIn: NSRect(x: p.x - 3, y: p.y - 3, width: 6, height: 6)).fill()
+    }
+
+    private func drawRulerGuides(_ rw: NSWindow, _ rv: RulerView) {
+        guard !rv.collapsed else { return }
         let rf = rw.frame
         let horiz = rv.orientation == .horizontal
         let model = RulerModel.shared
@@ -278,13 +365,11 @@ final class OverlayView: NSView {
             let wl = NSBezierPath(); wl.lineWidth = 1
             if horiz {
                 for x in [rf.minX, rf.maxX] {
-                    wl.move(to: toView(NSPoint(x: x, y: rf.minY - ext)))
-                    wl.line(to: toView(NSPoint(x: x, y: rf.maxY + ext)))
+                    wl.move(to: toView(NSPoint(x: x, y: rf.minY - ext))); wl.line(to: toView(NSPoint(x: x, y: rf.maxY + ext)))
                 }
             } else {
                 for y in [rf.minY, rf.maxY] {
-                    wl.move(to: toView(NSPoint(x: rf.minX - ext, y: y)))
-                    wl.line(to: toView(NSPoint(x: rf.maxX + ext, y: y)))
+                    wl.move(to: toView(NSPoint(x: rf.minX - ext, y: y))); wl.line(to: toView(NSPoint(x: rf.maxX + ext, y: y)))
                 }
             }
             wl.stroke()
@@ -306,17 +391,53 @@ final class OverlayView: NSView {
             guide.move(to: NSPoint(x: baseX, y: c.y)); guide.line(to: NSPoint(x: c.x, y: c.y))
         }
         guide.stroke()
+        dot(c, red)
+        label(model.formatted(points: abs(distPoints)), at: c, color: red)
+    }
 
-        red.setFill()
-        NSBezierPath(ovalIn: NSRect(x: c.x - 2.5, y: c.y - 2.5, width: 5, height: 5)).fill()
+    private func drawDistance() {
+        guard !pts.isEmpty else {
+            label("Click two points to measure", at: toView(cursorScreen), color: NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.9))
+            return
+        }
+        let red = NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.95)
+        red.setStroke()
+        let a = pts[0]
+        let bScreen = pts.count >= 2 ? pts[1] : cursorScreen
+        let av = toView(a), bv = toView(bScreen)
+        let line = NSBezierPath(); line.lineWidth = 1.5
+        line.move(to: av); line.line(to: bv); line.stroke()
+        dot(av, red); dot(bv, red)
+        let mid = NSPoint(x: (av.x + bv.x) / 2, y: (av.y + bv.y) / 2)
+        if let t = distanceText() { label(t, at: mid, color: red) }
+    }
 
-        let s = NSAttributedString(string: " \(model.formatted(points: abs(distPoints))) ", attributes: [
-            .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white, .backgroundColor: red])
-        let sz = s.size()
-        var lx = c.x + 8, ly = c.y + 8
-        lx = min(max(2, lx), bounds.width - sz.width - 2)
-        ly = min(max(2, ly), bounds.height - sz.height - 2)
-        s.draw(at: NSPoint(x: lx, y: ly))
+    private func drawArea() {
+        guard !pts.isEmpty else {
+            label("Click corners; double-click or Enter to close", at: toView(cursorScreen),
+                  color: NSColor(calibratedRed: 0.1, green: 0.4, blue: 0.85, alpha: 0.9))
+            return
+        }
+        let blue = NSColor(calibratedRed: 0.1, green: 0.45, blue: 0.9, alpha: 0.95)
+        var verts = pts
+        if !areaClosed { verts.append(cursorScreen) }
+        let vv = verts.map { toView($0) }
+
+        let path = NSBezierPath()
+        path.move(to: vv[0])
+        for p in vv.dropFirst() { path.line(to: p) }
+        if areaClosed { path.close() }
+
+        NSColor(calibratedRed: 0.1, green: 0.45, blue: 0.9, alpha: 0.15).setFill()
+        if areaClosed { path.fill() }
+        blue.setStroke(); path.lineWidth = 1.5; path.stroke()
+        for p in pts.map({ toView($0) }) { dot(p, blue) }
+
+        if verts.count >= 3 {
+            let cx = vv.reduce(0) { $0 + $1.x } / CGFloat(vv.count)
+            let cy = vv.reduce(0) { $0 + $1.y } / CGFloat(vv.count)
+            if let t = areaText() { label(t, at: NSPoint(x: cx, y: cy), color: blue) }
+        }
     }
 }
 
@@ -325,21 +446,17 @@ final class OverlayView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var rulerWindow: RulerPanel!
     var rulerView: RulerView!
-    var overlayWindow: NSWindow!
+    var overlayWindow: OverlayWindow!
     var overlayView: OverlayView!
     var panel: NSPanel!
     var calibLabel: NSTextField!
     var statusItem: NSStatusItem!
 
-    // toggle UI references kept in sync
-    var guideMenuItem: NSMenuItem?
-    var leadMenuItem: NSMenuItem?
-    var collapseMenuItem: NSMenuItem?
-    var guideStatusItem: NSMenuItem?
-    var leadStatusItem: NSMenuItem?
-    var collapseStatusItem: NSMenuItem?
-    var guideCheckbox: NSButton?
-    var leadCheckbox: NSButton?
+    var guideMenuItem, leadMenuItem, collapseMenuItem: NSMenuItem?
+    var guideStatusItem, leadStatusItem, collapseStatusItem: NSMenuItem?
+    var guideCheckbox, leadCheckbox: NSButton?
+    var modeRulerMenu, modeDistMenu, modeAreaMenu: NSMenuItem?
+    var modeRulerStatus, modeDistStatus, modeAreaStatus: NSMenuItem?
 
     private var globalMon: Any?
     private var localMon: Any?
@@ -348,11 +465,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var savedFrame: NSRect = .zero
     private var savedOrientation: RulerView.Orientation = .horizontal
 
+    private var pendingFrame: NSRect?
+    private var pendingVertical = false
+    private var hadSavedScale = false
+
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.regular)
+        loadDefaults()
         buildMenu()
         buildRuler()
-        applyDefaultScale()
+        if !hadSavedScale { applyDefaultScale() }
         buildOverlay()
         buildControlPanel()
         buildStatusItem()
@@ -368,18 +490,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }
+    func applicationWillTerminate(_ n: Notification) { saveDefaults() }
 
     private var rulerScreen: NSScreen? { rulerWindow?.screen ?? NSScreen.main }
 
     private func applyDefaultScale() {
         RulerModel.shared.mmPerPoint = 100 * physMMPerPoint(for: rulerScreen)
         RulerModel.shared.scaleRatio = 100
+        RulerModel.shared.calibrated = false
     }
 
-    // ---- ruler window -----------------------------------------------------
+    // ---- persistence ------------------------------------------------------
+
+    private func loadDefaults() {
+        let d = UserDefaults.standard
+        let m = RulerModel.shared
+        if d.object(forKey: "displayOverride") != nil {
+            let v = d.double(forKey: "displayOverride"); if v > 0 { displayOverrideMMPerPoint = v }
+        }
+        if d.object(forKey: "mmPerPoint") != nil { m.mmPerPoint = d.double(forKey: "mmPerPoint"); hadSavedScale = true }
+        if d.object(forKey: "scaleRatio") != nil { m.scaleRatio = d.double(forKey: "scaleRatio") }
+        m.useMetres = d.bool(forKey: "useMetres")
+        m.showGuide = d.object(forKey: "showGuide") != nil ? d.bool(forKey: "showGuide") : true
+        m.showLeadLines = d.object(forKey: "showLeadLines") != nil ? d.bool(forKey: "showLeadLines") : true
+        m.calibrated = d.bool(forKey: "calibrated")
+        pendingVertical = d.bool(forKey: "vertical")
+        if let s = d.string(forKey: "rulerFrame") {
+            let r = NSRectFromString(s); if r.width > 10 && r.height > 10 { pendingFrame = r }
+        }
+    }
+
+    private func saveDefaults() {
+        let d = UserDefaults.standard
+        let m = RulerModel.shared
+        d.set(m.mmPerPoint, forKey: "mmPerPoint")
+        d.set(m.scaleRatio, forKey: "scaleRatio")
+        d.set(m.useMetres, forKey: "useMetres")
+        d.set(m.showGuide, forKey: "showGuide")
+        d.set(m.showLeadLines, forKey: "showLeadLines")
+        d.set(m.calibrated, forKey: "calibrated")
+        d.set(rulerView.orientation == .vertical, forKey: "vertical")
+        if let o = displayOverrideMMPerPoint { d.set(o, forKey: "displayOverride") }
+        let fr = collapsed ? savedFrame : rulerWindow.frame
+        d.set(NSStringFromRect(fr), forKey: "rulerFrame")
+    }
+
+    // ---- windows ----------------------------------------------------------
 
     private func buildRuler() {
-        let frame = NSRect(x: 240, y: 420, width: 620, height: 56)
+        var frame = NSRect(x: 240, y: 420, width: 620, height: 56)
+        if let f = pendingFrame { frame = f }
         rulerWindow = RulerPanel(contentRect: frame,
                                  styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)
@@ -391,23 +551,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rulerWindow.hasShadow = true
         rulerWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         rulerView = RulerView(frame: NSRect(origin: .zero, size: frame.size))
+        rulerView.orientation = pendingVertical ? .vertical : .horizontal
         rulerView.onDoubleClick = { [weak self] in self?.toggleCollapse() }
         rulerWindow.contentView = rulerView
         rulerWindow.makeKeyAndOrderFront(nil)
     }
-
-    // ---- overlay window ---------------------------------------------------
 
     private func buildOverlay() {
         var union = NSRect.zero
         for s in NSScreen.screens { union = (union == .zero) ? s.frame : union.union(s.frame) }
         if union == .zero { union = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900) }
 
-        overlayWindow = NSWindow(contentRect: union, styleMask: [.borderless], backing: .buffered, defer: false)
+        overlayWindow = OverlayWindow(contentRect: union, styleMask: [.borderless], backing: .buffered, defer: false)
         overlayWindow.isOpaque = false
         overlayWindow.backgroundColor = .clear
         overlayWindow.hasShadow = false
         overlayWindow.ignoresMouseEvents = true
+        overlayWindow.acceptsMouseMovedEvents = true
         overlayWindow.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
         overlayWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
@@ -437,39 +597,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ---- control panel ----------------------------------------------------
 
     private func buildControlPanel() {
-        let frame = NSRect(x: 240, y: 150, width: 300, height: 256)
-        panel = NSPanel(contentRect: frame,
-                        styleMask: [.titled, .closable, .utilityWindow],
-                        backing: .buffered, defer: false)
-        panel.title = "Scale Plan Ruler"
+        let frame = NSRect(x: 240, y: 120, width: 300, height: 340)
+        panel = NSPanel(contentRect: frame, styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.title = "Desktop Scale Ruler"
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
 
         func button(_ title: String, _ sel: Selector) -> NSButton {
-            let b = NSButton(title: title, target: self, action: sel)
-            b.bezelStyle = .rounded
-            return b
+            let b = NSButton(title: title, target: self, action: sel); b.bezelStyle = .rounded; return b
         }
 
         let calibrateBtn = button("Calibrate to known dimension…", #selector(calibrate))
+        let dispBtn = button("Calibrate display (once)…", #selector(calibrateDisplay))
         let row100 = button("1:100", #selector(scale100))
         let row50  = button("1:50",  #selector(scale50))
         let custom = button("Custom 1:n…", #selector(customScale))
         let orient = button("Rotate ↔ / ↕", #selector(toggleOrientation))
         let units  = button("mm / m", #selector(toggleUnits))
         let minBtn = button("Minimise ruler", #selector(toggleCollapse))
+        let mRuler = button("Ruler", #selector(modeRuler))
+        let mDist  = button("Distance", #selector(modeDistance))
+        let mArea  = button("Area", #selector(modeArea))
 
         guideCheckbox = NSButton(checkboxWithTitle: "Cursor guide", target: self, action: #selector(toggleGuide))
         leadCheckbox  = NSButton(checkboxWithTitle: "Lead lines",  target: self, action: #selector(toggleLeadLines))
 
-        let scaleRow = NSStackView(views: [row100, row50, custom])
-        scaleRow.orientation = .horizontal; scaleRow.distribution = .fillEqually; scaleRow.spacing = 6
-        let toolRow = NSStackView(views: [orient, units])
-        toolRow.orientation = .horizontal; toolRow.distribution = .fillEqually; toolRow.spacing = 6
-        let checkRow = NSStackView(views: [guideCheckbox!, leadCheckbox!])
-        checkRow.orientation = .horizontal; checkRow.distribution = .fillEqually; checkRow.spacing = 6
+        func hrow(_ vs: [NSView]) -> NSStackView {
+            let r = NSStackView(views: vs); r.orientation = .horizontal; r.distribution = .fillEqually; r.spacing = 6; return r
+        }
 
         calibLabel = NSTextField(labelWithString: "")
         calibLabel.font = NSFont.systemFont(ofSize: 11)
@@ -478,14 +635,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         calibLabel.lineBreakMode = .byTruncatingTail
 
         let hint = NSTextField(wrappingLabelWithString:
-            "Calibrate against a known dimension for accuracy. Presets are set for Preview's “Actual Size”. Double-click the ruler to minimise it.")
+            "Calibrate against a known dimension for accuracy (turns the readout green). Distance/Area capture clicks — press Esc or pick Ruler to return. Double-click the ruler to minimise.")
         hint.font = NSFont.systemFont(ofSize: 10)
         hint.textColor = .tertiaryLabelColor
         hint.preferredMaxLayoutWidth = 268
         hint.widthAnchor.constraint(equalToConstant: 268).isActive = true
         calibLabel.widthAnchor.constraint(equalToConstant: 268).isActive = true
 
-        let stack = NSStackView(views: [calibrateBtn, scaleRow, toolRow, checkRow, minBtn, calibLabel, hint])
+        let stack = NSStackView(views: [
+            calibrateBtn, dispBtn,
+            hrow([row100, row50, custom]),
+            hrow([mRuler, mDist, mArea]),
+            hrow([orient, units]),
+            hrow([guideCheckbox!, leadCheckbox!]),
+            minBtn, calibLabel, hint])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.distribution = .fill
@@ -506,40 +669,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateCalibLabel() {
         let m = RulerModel.shared
-        calibLabel?.stringValue = String(format: "1 pt = %.2f mm   •   ≈ 1:%.0f", m.mmPerPoint, m.scaleRatio)
+        let tag = m.calibrated ? "calibrated" : "preset"
+        calibLabel?.stringValue = String(format: "1 pt = %.2f mm  •  ≈ 1:%.0f  •  %@", m.mmPerPoint, m.scaleRatio, tag)
     }
 
-    // ---- status-bar item (right side of the menu bar) ---------------------
+    // ---- status-bar item --------------------------------------------------
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
-            if let img = NSImage(systemSymbolName: "ruler", accessibilityDescription: "Scale Plan Ruler") {
-                btn.image = img
-            } else {
-                btn.title = "📏"
-            }
+            if let img = NSImage(systemSymbolName: "ruler", accessibilityDescription: "Desktop Scale Ruler") { btn.image = img }
+            else { btn.title = "📏" }
         }
         let menu = NSMenu()
         func add(_ title: String, _ sel: Selector) -> NSMenuItem {
-            let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
-            it.target = self
-            menu.addItem(it)
-            return it
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: ""); it.target = self; menu.addItem(it); return it
         }
+        modeRulerStatus = add("Mode: Ruler", #selector(modeRuler))
+        modeDistStatus  = add("Mode: Distance (2 points)", #selector(modeDistance))
+        modeAreaStatus  = add("Mode: Area", #selector(modeArea))
+        menu.addItem(.separator())
         _ = add("Calibrate to Known Dimension…", #selector(calibrate))
+        _ = add("Calibrate Display (once)…", #selector(calibrateDisplay))
         _ = add("Scale 1:100", #selector(scale100))
         _ = add("Scale 1:50", #selector(scale50))
         _ = add("Custom Scale…", #selector(customScale))
         menu.addItem(.separator())
         _ = add("Rotate Horizontal / Vertical", #selector(toggleOrientation))
         _ = add("Toggle mm / m", #selector(toggleUnits))
+        _ = add("Copy Measurement", #selector(copyMeasurement))
         guideStatusItem = add("Cursor Guide", #selector(toggleGuide))
         leadStatusItem = add("Lead Lines", #selector(toggleLeadLines))
         collapseStatusItem = add("Minimise Ruler", #selector(toggleCollapse))
         menu.addItem(.separator())
         _ = add("Show Controls Window", #selector(showControls))
-        let quit = NSMenuItem(title: "Quit Scale Plan Ruler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Desktop Scale Ruler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         statusItem.menu = menu
     }
@@ -576,14 +740,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let m = RulerModel.shared
         m.mmPerPoint = mm / Double(span)
         m.scaleRatio = m.mmPerPoint / physMMPerPoint(for: rulerScreen)
-        m.notify()
+        m.calibrated = true
+        m.notify(); saveDefaults()
+    }
+
+    @objc private func calibrateDisplay() {
+        if collapsed { toggleCollapse() }
+        let span = rulerView.currentSpanPoints
+        guard span > 0 else { return }
+        guard let mm = promptForNumber(
+            title: "Calibrate this display (once)",
+            message: "Hold a physical ruler or card against the screen. Stretch the on-screen ruler to a known PHYSICAL length, then enter that length in mm (a credit card is 85.6 mm wide).",
+            placeholder: "e.g. 85.6") else { return }
+        displayOverrideMMPerPoint = mm / Double(span)
+        let m = RulerModel.shared
+        if m.calibrated { m.scaleRatio = m.mmPerPoint / physMMPerPoint(for: rulerScreen) }
+        else { setNominalScale(m.scaleRatio) }
+        m.notify(); saveDefaults()
     }
 
     private func setNominalScale(_ s: Double) {
         let m = RulerModel.shared
         m.scaleRatio = s
         m.mmPerPoint = s * physMMPerPoint(for: rulerScreen)
-        m.notify()
+        m.calibrated = false
+        m.notify(); saveDefaults()
     }
 
     @objc private func scale100() { setNominalScale(100) }
@@ -608,24 +789,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rulerWindow.setFrame(NSRect(x: f.origin.x, y: f.origin.y, width: max(160, f.height), height: thickness), display: true)
             rulerView.orientation = .horizontal
         }
-        RulerModel.shared.notify()
+        RulerModel.shared.notify(); saveDefaults()
     }
 
-    @objc private func toggleUnits() {
-        RulerModel.shared.useMetres.toggle()
-        RulerModel.shared.notify()
-    }
+    @objc private func toggleUnits() { RulerModel.shared.useMetres.toggle(); RulerModel.shared.notify(); saveDefaults() }
 
     @objc private func toggleGuide() {
-        RulerModel.shared.showGuide.toggle()
-        syncToggleStates()
-        overlayView.needsDisplay = true
+        RulerModel.shared.showGuide.toggle(); syncToggleStates(); overlayView.needsDisplay = true; saveDefaults()
     }
-
     @objc private func toggleLeadLines() {
-        RulerModel.shared.showLeadLines.toggle()
-        syncToggleStates()
-        overlayView.needsDisplay = true
+        RulerModel.shared.showLeadLines.toggle(); syncToggleStates(); overlayView.needsDisplay = true; saveDefaults()
     }
 
     @objc private func toggleCollapse() {
@@ -639,16 +812,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             savedFrame = rulerWindow.frame
             savedOrientation = rulerView.orientation
             let f = rulerWindow.frame
-            let origin = NSPoint(x: f.minX, y: f.maxY - collapsedSize.height)
             rulerView.collapsed = true
-            rulerWindow.setFrame(NSRect(origin: origin, size: collapsedSize), display: true)
+            rulerWindow.setFrame(NSRect(origin: NSPoint(x: f.minX, y: f.maxY - collapsedSize.height), size: collapsedSize), display: true)
             collapsed = true
         }
-        syncToggleStates()
-        overlayView.needsDisplay = true
+        syncToggleStates(); overlayView.needsDisplay = true
     }
 
     @objc private func showControls() { panel.makeKeyAndOrderFront(nil) }
+
+    // ---- measure modes ----------------------------------------------------
+
+    private func setMode(_ mode: MeasureMode) {
+        RulerModel.shared.mode = mode
+        let interactive = (mode != .ruler)
+        overlayWindow.ignoresMouseEvents = !interactive
+        overlayWindow.interactive = interactive
+        overlayView.pts.removeAll(); overlayView.areaClosed = false
+        if interactive {
+            NSApp.activate(ignoringOtherApps: true)
+            overlayWindow.makeKeyAndOrderFront(nil)
+            overlayWindow.makeFirstResponder(overlayView)
+        }
+        syncToggleStates(); overlayView.needsDisplay = true
+    }
+
+    @objc private func modeRuler() { setMode(.ruler) }
+    @objc private func modeDistance() { setMode(.distance) }
+    @objc private func modeArea() { setMode(.area) }
+
+    @objc private func copyMeasurement() {
+        let m = RulerModel.shared
+        var text = ""
+        switch m.mode {
+        case .ruler: text = "\(m.formatted(points: rulerView.currentSpanPoints)) (\(m.scaleLabel))"
+        case .distance: text = overlayView.distanceText() ?? ""
+        case .area: text = overlayView.areaText() ?? ""
+        }
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // ---- sync -------------------------------------------------------------
 
     private func syncToggleStates() {
         let m = RulerModel.shared
@@ -656,9 +862,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let l: NSControl.StateValue = m.showLeadLines ? .on : .off
         guideMenuItem?.state = g; guideStatusItem?.state = g; guideCheckbox?.state = g
         leadMenuItem?.state = l;  leadStatusItem?.state = l;  leadCheckbox?.state = l
-        let collapseTitle = collapsed ? "Expand Ruler" : "Minimise Ruler"
-        collapseMenuItem?.title = collapseTitle
-        collapseStatusItem?.title = collapseTitle
+
+        collapseMenuItem?.title = collapsed ? "Expand Ruler" : "Minimise Ruler"
+        collapseStatusItem?.title = collapsed ? "Expand Ruler" : "Minimise Ruler"
+
+        func ms(_ on: Bool) -> NSControl.StateValue { on ? .on : .off }
+        modeRulerMenu?.state = ms(m.mode == .ruler); modeRulerStatus?.state = ms(m.mode == .ruler)
+        modeDistMenu?.state  = ms(m.mode == .distance); modeDistStatus?.state = ms(m.mode == .distance)
+        modeAreaMenu?.state  = ms(m.mode == .area); modeAreaStatus?.state = ms(m.mode == .area)
     }
 
     // ---- menu -------------------------------------------------------------
@@ -668,18 +879,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
-        appMenu.addItem(withTitle: "About Scale Plan Ruler", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About Desktop Scale Ruler", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Quit Scale Plan Ruler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit Desktop Scale Ruler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         let rulerItem = NSMenuItem(); main.addItem(rulerItem)
         let rulerMenu = NSMenu(title: "Ruler"); rulerItem.submenu = rulerMenu
+        modeRulerMenu = rulerMenu.addItem(withTitle: "Mode: Ruler", action: #selector(modeRuler), keyEquivalent: "b")
+        modeDistMenu  = rulerMenu.addItem(withTitle: "Mode: Distance (2 points)", action: #selector(modeDistance), keyEquivalent: "d")
+        modeAreaMenu  = rulerMenu.addItem(withTitle: "Mode: Area", action: #selector(modeArea), keyEquivalent: "e")
+        rulerMenu.addItem(.separator())
         rulerMenu.addItem(withTitle: "Calibrate to Known Dimension…", action: #selector(calibrate), keyEquivalent: "k")
+        rulerMenu.addItem(withTitle: "Calibrate Display (once)…", action: #selector(calibrateDisplay), keyEquivalent: "K")
         rulerMenu.addItem(withTitle: "Scale 1:100", action: #selector(scale100), keyEquivalent: "1")
         rulerMenu.addItem(withTitle: "Scale 1:50", action: #selector(scale50), keyEquivalent: "2")
         rulerMenu.addItem(withTitle: "Custom Scale…", action: #selector(customScale), keyEquivalent: "0")
         rulerMenu.addItem(.separator())
+        rulerMenu.addItem(withTitle: "Copy Measurement", action: #selector(copyMeasurement), keyEquivalent: "c")
         rulerMenu.addItem(withTitle: "Rotate Horizontal / Vertical", action: #selector(toggleOrientation), keyEquivalent: "r")
         rulerMenu.addItem(withTitle: "Toggle mm / m", action: #selector(toggleUnits), keyEquivalent: "u")
         guideMenuItem = rulerMenu.addItem(withTitle: "Cursor Guide", action: #selector(toggleGuide), keyEquivalent: "g")
