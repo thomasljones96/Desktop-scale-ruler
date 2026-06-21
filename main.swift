@@ -1,5 +1,6 @@
 import Cocoa
 import CoreGraphics
+import UniformTypeIdentifiers
 
 // ============================================================================
 //  DesktopScaleRuler — floating screen ruler for on-screen PDF plans.
@@ -8,8 +9,9 @@ import CoreGraphics
 //  • PRESETS (1:100 / 1:50 / custom): computed from the display's real physical
 //    size, correct at Preview "Actual Size". Run "Calibrate Display" once for
 //    perfect accuracy.
-//  • MEASURE MODES: Ruler (default), Distance (two points + angle), Area (m²).
-//  Settings persist between launches.
+//  • MEASURE MODES: Ruler (default), Distance (two-point length + angle), Area (m²),
+//    Count (click tally). Measurements feed a named-set TAKEOFF list with
+//    subtotals, grand totals and CSV export. Settings + takeoff persist.
 // ============================================================================
 
 let FALLBACK_MM_PER_POINT = 25.4 / 108.0
@@ -29,7 +31,7 @@ func physMMPerPoint(for screen: NSScreen?) -> Double {
     return Double(mm.width) / Double(pts)
 }
 
-enum MeasureMode { case ruler, distance, area }
+enum MeasureMode { case ruler, distance, area, count }
 
 // MARK: - Shared model -------------------------------------------------------
 
@@ -56,6 +58,87 @@ final class RulerModel {
     }
 
     var scaleLabel: String { String(format: "1:%g", scaleRatio) }
+}
+
+// MARK: - Takeoff store ------------------------------------------------------
+
+struct TakeoffItem: Codable {
+    enum Kind: String, Codable { case distance, area, count }
+    var kind: Kind
+    var value: Double      // distance: mm, area: m², count: 1 per click
+    var set: String
+}
+
+final class TakeoffStore {
+    static let shared = TakeoffStore()
+    private(set) var items: [TakeoffItem] = []
+    var activeSet: String = "Set 1"
+    var onChange: (() -> Void)?
+
+    private var fileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DesktopScaleRuler", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("takeoff.json")
+    }
+
+    func load() {
+        guard let d = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([TakeoffItem].self, from: d) else { return }
+        items = decoded
+        if let last = items.last { activeSet = last.set }
+    }
+    private func save() { if let d = try? JSONEncoder().encode(items) { try? d.write(to: fileURL) } }
+
+    func add(_ kind: TakeoffItem.Kind, _ value: Double) {
+        items.append(TakeoffItem(kind: kind, value: value, set: activeSet)); save(); onChange?()
+    }
+    func undoLast() { guard !items.isEmpty else { return }; items.removeLast(); save(); onChange?() }
+    func clearAll() { items.removeAll(); save(); onChange?() }
+    func newSet(_ name: String) { activeSet = name; onChange?() }
+
+    private func orderedSets() -> [String] {
+        var seen: [String] = []
+        for it in items where !seen.contains(it.set) { seen.append(it.set) }
+        if !seen.contains(activeSet) { seen.append(activeSet) }
+        return seen
+    }
+
+    func summaryText() -> String {
+        var out = ""
+        var gLen = 0.0, gArea = 0.0, gCount = 0
+        for set in orderedSets() {
+            let its = items.filter { $0.set == set }
+            out += "▸ \(set)\(set == activeSet ? "   (active)" : "")\n"
+            var sLen = 0.0, sArea = 0.0, sCount = 0, idx = 1
+            for it in its {
+                switch it.kind {
+                case .distance: out += String(format: "    %2d.  length   %.3f m\n", idx, it.value / 1000); sLen += it.value / 1000; idx += 1
+                case .area:     out += String(format: "    %2d.  area     %.2f m²\n", idx, it.value); sArea += it.value; idx += 1
+                case .count:    sCount += 1
+                }
+            }
+            if sCount > 0 { out += String(format: "    count: %d ea\n", sCount) }
+            out += String(format: "    — subtotal:  %.3f m   %.2f m²   %d ea\n\n", sLen, sArea, sCount)
+            gLen += sLen; gArea += sArea; gCount += sCount
+        }
+        if items.isEmpty { out += "No measurements yet.\nPick Distance, Area or Count mode and measure on the plan.\n\n" }
+        out += String(format: "TOTAL:  %.3f m   •   %.2f m²   •   %d ea", gLen, gArea, gCount)
+        return out
+    }
+
+    func csv() -> String {
+        func esc(_ s: String) -> String { s.contains(",") || s.contains("\"") ? "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" : s }
+        var rows = ["Set,Type,Value,Unit"]
+        for it in items {
+            switch it.kind {
+            case .distance: rows.append("\(esc(it.set)),Length,\(String(format: "%.3f", it.value / 1000)),m")
+            case .area:     rows.append("\(esc(it.set)),Area,\(String(format: "%.3f", it.value)),m2")
+            case .count:    rows.append("\(esc(it.set)),Count,1,ea")
+            }
+        }
+        return rows.joined(separator: "\n") + "\n"
+    }
 }
 
 // MARK: - Windows ------------------------------------------------------------
@@ -270,6 +353,7 @@ final class OverlayView: NSView {
     var cursorScreen: NSPoint = .zero
     var pts: [NSPoint] = []          // screen-coord points for distance/area
     var areaClosed = false
+    var countMarkers: [NSPoint] = [] // screen-coord markers for count mode
 
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
@@ -282,15 +366,26 @@ final class OverlayView: NSView {
     override func mouseDown(with e: NSEvent) {
         let mode = RulerModel.shared.mode
         guard mode != .ruler else { return }
-        if e.clickCount >= 2 {
-            if mode == .area && pts.count >= 3 { areaClosed = true }
-            needsDisplay = true; return
-        }
         let p = screenPoint(e)
         switch mode {
-        case .distance: if pts.count >= 2 { pts = [p] } else { pts.append(p) }
-        case .area:     if areaClosed { pts = []; areaClosed = false }; pts.append(p)
-        case .ruler:    break
+        case .count:
+            countMarkers.append(p)
+            TakeoffStore.shared.add(.count, 1)
+        case .distance:
+            if pts.count == 1 {                    // second click → commit this length
+                let a = pts[0]
+                let dist = CGFloat(hypot(Double(p.x - a.x), Double(p.y - a.y)))
+                let mm = RulerModel.shared.realMM(points: dist)
+                if mm > 0 { TakeoffStore.shared.add(.distance, mm) }
+                pts.removeAll()
+            } else {                               // first click → drop the start point
+                pts = [p]
+            }
+        case .area:
+            if e.clickCount >= 2 { if pts.count >= 3 { commitArea() } else { pts.removeAll() }; needsDisplay = true; return }
+            pts.append(p)
+        case .ruler:
+            break
         }
         needsDisplay = true
     }
@@ -299,15 +394,24 @@ final class OverlayView: NSView {
 
     override func keyDown(with e: NSEvent) {
         switch e.keyCode {
-        case 53: pts.removeAll(); areaClosed = false; needsDisplay = true
-        case 36, 76: if RulerModel.shared.mode == .area && pts.count >= 3 { areaClosed = true; needsDisplay = true }
+        case 53: pts.removeAll(); needsDisplay = true                                   // Esc: end run / clear polygon
+        case 36, 76:                                                                    // Return/Enter: close + commit area
+            if RulerModel.shared.mode == .area && pts.count >= 3 { commitArea(); needsDisplay = true }
         default: super.keyDown(with: e)
         }
     }
 
+    private func commitArea() {
+        let aPts = OverlayView.polygonArea(pts)
+        let mpp = RulerModel.shared.mmPerPoint
+        let m2 = Double(aPts) * mpp * mpp / 1_000_000.0
+        if m2 > 0 { TakeoffStore.shared.add(.area, m2) }
+        pts.removeAll(); areaClosed = false
+    }
+
     func distanceText() -> String? {
-        guard pts.count >= 1 else { return nil }
-        let a = pts[0]; let b = pts.count >= 2 ? pts[1] : cursorScreen
+        guard let a = pts.last else { return nil }
+        let b = cursorScreen
         let dist = CGFloat(hypot(Double(b.x - a.x), Double(b.y - a.y)))
         let ang = atan2(Double(b.y - a.y), Double(b.x - a.x)) * 180 / Double.pi
         return "\(RulerModel.shared.formatted(points: dist))  \(String(format: "%.1f°", abs(ang)))"
@@ -335,6 +439,7 @@ final class OverlayView: NSView {
         case .ruler:    drawRulerGuides(rw, rv)
         case .distance: drawDistance()
         case .area:     drawArea()
+        case .count:    drawCount()
         }
     }
 
@@ -396,20 +501,34 @@ final class OverlayView: NSView {
     }
 
     private func drawDistance() {
-        guard !pts.isEmpty else {
-            label("Click two points to measure", at: toView(cursorScreen), color: NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.9))
+        let red = NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.95)
+        guard let a = pts.last else {
+            label("Click two points to measure each length", at: toView(cursorScreen), color: red)
             return
         }
-        let red = NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.95)
         red.setStroke()
-        let a = pts[0]
-        let bScreen = pts.count >= 2 ? pts[1] : cursorScreen
-        let av = toView(a), bv = toView(bScreen)
+        let av = toView(a), bv = toView(cursorScreen)
         let line = NSBezierPath(); line.lineWidth = 1.5
         line.move(to: av); line.line(to: bv); line.stroke()
         dot(av, red); dot(bv, red)
         let mid = NSPoint(x: (av.x + bv.x) / 2, y: (av.y + bv.y) / 2)
         if let t = distanceText() { label(t, at: mid, color: red) }
+    }
+
+    private func drawCount() {
+        let purple = NSColor(calibratedRed: 0.55, green: 0.15, blue: 0.72, alpha: 0.95)
+        if countMarkers.isEmpty {
+            label("Click to count items into “\(TakeoffStore.shared.activeSet)”", at: toView(cursorScreen), color: purple)
+        }
+        for (i, m) in countMarkers.enumerated() {
+            let v = toView(m)
+            purple.setFill()
+            NSBezierPath(ovalIn: NSRect(x: v.x - 9, y: v.y - 9, width: 18, height: 18)).fill()
+            let s = NSAttributedString(string: "\(i + 1)", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 10), .foregroundColor: NSColor.white])
+            let sz = s.size()
+            s.draw(at: NSPoint(x: v.x - sz.width / 2, y: v.y - sz.height / 2))
+        }
     }
 
     private func drawArea() {
@@ -452,11 +571,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var calibLabel: NSTextField!
     var statusItem: NSStatusItem!
 
+    var takeoffWindow: NSPanel!
+    var takeoffTextView: NSTextView!
+    var takeoffSetLabel: NSTextField!
+
     var guideMenuItem, leadMenuItem, collapseMenuItem: NSMenuItem?
     var guideStatusItem, leadStatusItem, collapseStatusItem: NSMenuItem?
     var guideCheckbox, leadCheckbox: NSButton?
-    var modeRulerMenu, modeDistMenu, modeAreaMenu: NSMenuItem?
-    var modeRulerStatus, modeDistStatus, modeAreaStatus: NSMenuItem?
+    var modeRulerMenu, modeDistMenu, modeAreaMenu, modeCountMenu: NSMenuItem?
+    var modeRulerStatus, modeDistStatus, modeAreaStatus, modeCountStatus: NSMenuItem?
 
     private var globalMon: Any?
     private var localMon: Any?
@@ -483,6 +606,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.overlayView.needsDisplay = true
             self?.updateCalibLabel()
         }
+        TakeoffStore.shared.load()
+        TakeoffStore.shared.onChange = { [weak self] in self?.refreshTakeoff() }
         startTracking()
         updateCalibLabel()
         syncToggleStates()
@@ -597,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ---- control panel ----------------------------------------------------
 
     private func buildControlPanel() {
-        let frame = NSRect(x: 240, y: 120, width: 300, height: 340)
+        let frame = NSRect(x: 240, y: 100, width: 300, height: 384)
         panel = NSPanel(contentRect: frame, styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Desktop Scale Ruler"
         panel.isFloatingPanel = true
@@ -620,6 +745,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mRuler = button("Ruler", #selector(modeRuler))
         let mDist  = button("Distance", #selector(modeDistance))
         let mArea  = button("Area", #selector(modeArea))
+        let mCount = button("Count", #selector(modeCount))
+        let takeoffBtn = button("Takeoff list…", #selector(showTakeoff))
 
         guideCheckbox = NSButton(checkboxWithTitle: "Cursor guide", target: self, action: #selector(toggleGuide))
         leadCheckbox  = NSButton(checkboxWithTitle: "Lead lines",  target: self, action: #selector(toggleLeadLines))
@@ -635,7 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         calibLabel.lineBreakMode = .byTruncatingTail
 
         let hint = NSTextField(wrappingLabelWithString:
-            "Calibrate against a known dimension for accuracy (turns the readout green). Distance/Area capture clicks — press Esc or pick Ruler to return. Double-click the ruler to minimise.")
+            "Distance/Area/Count capture clicks — Esc ends the current run; switch to Ruler to give the screen back. New measurements drop into the active takeoff set. Open the Takeoff list to name sets, see totals and export CSV.")
         hint.font = NSFont.systemFont(ofSize: 10)
         hint.textColor = .tertiaryLabelColor
         hint.preferredMaxLayoutWidth = 268
@@ -645,10 +772,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stack = NSStackView(views: [
             calibrateBtn, dispBtn,
             hrow([row100, row50, custom]),
-            hrow([mRuler, mDist, mArea]),
+            hrow([mRuler, mDist, mArea, mCount]),
             hrow([orient, units]),
             hrow([guideCheckbox!, leadCheckbox!]),
-            minBtn, calibLabel, hint])
+            takeoffBtn, minBtn, calibLabel, hint])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.distribution = .fill
@@ -688,6 +815,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         modeRulerStatus = add("Mode: Ruler", #selector(modeRuler))
         modeDistStatus  = add("Mode: Distance (2 points)", #selector(modeDistance))
         modeAreaStatus  = add("Mode: Area", #selector(modeArea))
+        modeCountStatus = add("Mode: Count (tally)", #selector(modeCount))
+        menu.addItem(.separator())
+        _ = add("Show Takeoff List", #selector(showTakeoff))
+        _ = add("New Takeoff Set…", #selector(newTakeoffSet))
+        _ = add("Export Takeoff CSV…", #selector(exportTakeoffCSV))
         menu.addItem(.separator())
         _ = add("Calibrate to Known Dimension…", #selector(calibrate))
         _ = add("Calibrate Display (once)…", #selector(calibrateDisplay))
@@ -821,6 +953,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showControls() { panel.makeKeyAndOrderFront(nil) }
 
+    // ---- takeoff ----------------------------------------------------------
+
+    private func promptForString(title: String, message: String, placeholder: String) -> String? {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = title
+        alert.informativeText = message
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        tf.placeholderString = placeholder
+        alert.accessoryView = tf
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.layout()
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return tf.stringValue
+    }
+
+    private func buildTakeoffWindow() {
+        let frame = NSRect(x: 560, y: 140, width: 380, height: 470)
+        takeoffWindow = NSPanel(contentRect: frame,
+                                styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                                backing: .buffered, defer: false)
+        takeoffWindow.title = "Takeoff List"
+        takeoffWindow.isFloatingPanel = true
+        takeoffWindow.level = .floating
+        takeoffWindow.hidesOnDeactivate = false
+        takeoffWindow.isReleasedWhenClosed = false
+
+        let content = takeoffWindow.contentView!
+
+        takeoffSetLabel = NSTextField(labelWithString: "")
+        takeoffSetLabel.font = NSFont.boldSystemFont(ofSize: 12)
+        takeoffSetLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        takeoffTextView = NSTextView()
+        takeoffTextView.isEditable = false
+        takeoffTextView.isRichText = false
+        takeoffTextView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        takeoffTextView.textContainerInset = NSSize(width: 6, height: 6)
+        takeoffTextView.isVerticallyResizable = true
+        takeoffTextView.isHorizontallyResizable = false
+        takeoffTextView.autoresizingMask = [.width]
+        takeoffTextView.minSize = NSSize(width: 0, height: 0)
+        takeoffTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        takeoffTextView.textContainer?.widthTracksTextView = true
+        scroll.documentView = takeoffTextView
+
+        func btn(_ t: String, _ sel: Selector) -> NSButton {
+            let b = NSButton(title: t, target: self, action: sel); b.bezelStyle = .rounded; return b
+        }
+        func hrow(_ vs: [NSView]) -> NSStackView {
+            let r = NSStackView(views: vs); r.orientation = .horizontal; r.distribution = .fillEqually; r.spacing = 6
+            r.translatesAutoresizingMaskIntoConstraints = false; return r
+        }
+        let row1 = hrow([btn("New set…", #selector(newTakeoffSet)), btn("Undo", #selector(undoTakeoff)), btn("Clear", #selector(clearTakeoff))])
+        let row2 = hrow([btn("Export CSV…", #selector(exportTakeoffCSV)), btn("Copy", #selector(copyTakeoff))])
+
+        content.addSubview(takeoffSetLabel)
+        content.addSubview(scroll)
+        content.addSubview(row1)
+        content.addSubview(row2)
+        let pad: CGFloat = 12
+        NSLayoutConstraint.activate([
+            takeoffSetLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: pad),
+            takeoffSetLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: pad),
+            takeoffSetLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -pad),
+
+            scroll.topAnchor.constraint(equalTo: takeoffSetLabel.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: pad),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -pad),
+
+            row1.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            row1.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: pad),
+            row1.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -pad),
+
+            row2.topAnchor.constraint(equalTo: row1.bottomAnchor, constant: 6),
+            row2.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: pad),
+            row2.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -pad),
+            row2.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -pad)
+        ])
+    }
+
+    private func refreshTakeoff() {
+        guard takeoffTextView != nil else { return }
+        takeoffSetLabel.stringValue = "Active set:  \(TakeoffStore.shared.activeSet)"
+        takeoffTextView.string = TakeoffStore.shared.summaryText()
+    }
+
+    @objc private func showTakeoff() {
+        if takeoffWindow == nil { buildTakeoffWindow() }
+        refreshTakeoff()
+        takeoffWindow.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func newTakeoffSet() {
+        guard let raw = promptForString(title: "New takeoff set",
+                                        message: "Name this set (e.g. Ground floor walls, Footings, Slab). New measurements go into it.",
+                                        placeholder: "Set name") else { return }
+        let name = raw.trimmingCharacters(in: .whitespaces)
+        if !name.isEmpty { TakeoffStore.shared.newSet(name) }
+    }
+
+    @objc private func undoTakeoff() { TakeoffStore.shared.undoLast() }
+
+    @objc private func clearTakeoff() {
+        let a = NSAlert()
+        a.messageText = "Clear all takeoff items?"
+        a.informativeText = "This removes every measurement from every set. It can't be undone."
+        a.addButton(withTitle: "Clear")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn { TakeoffStore.shared.clearAll() }
+    }
+
+    @objc private func exportTakeoffCSV() {
+        let p = NSSavePanel()
+        p.nameFieldStringValue = "takeoff.csv"
+        p.allowedContentTypes = [.commaSeparatedText]
+        if p.runModal() == .OK, let url = p.url {
+            try? TakeoffStore.shared.csv().write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    @objc private func copyTakeoff() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(TakeoffStore.shared.csv(), forType: .string)
+    }
+
     // ---- measure modes ----------------------------------------------------
 
     private func setMode(_ mode: MeasureMode) {
@@ -828,7 +1091,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let interactive = (mode != .ruler)
         overlayWindow.ignoresMouseEvents = !interactive
         overlayWindow.interactive = interactive
-        overlayView.pts.removeAll(); overlayView.areaClosed = false
+        overlayView.pts.removeAll(); overlayView.areaClosed = false; overlayView.countMarkers.removeAll()
         if interactive {
             NSApp.activate(ignoringOtherApps: true)
             overlayWindow.makeKeyAndOrderFront(nil)
@@ -840,6 +1103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func modeRuler() { setMode(.ruler) }
     @objc private func modeDistance() { setMode(.distance) }
     @objc private func modeArea() { setMode(.area) }
+    @objc private func modeCount() { setMode(.count) }
 
     @objc private func copyMeasurement() {
         let m = RulerModel.shared
@@ -848,6 +1112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .ruler: text = "\(m.formatted(points: rulerView.currentSpanPoints)) (\(m.scaleLabel))"
         case .distance: text = overlayView.distanceText() ?? ""
         case .area: text = overlayView.areaText() ?? ""
+        case .count: text = ""
         }
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
@@ -870,6 +1135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         modeRulerMenu?.state = ms(m.mode == .ruler); modeRulerStatus?.state = ms(m.mode == .ruler)
         modeDistMenu?.state  = ms(m.mode == .distance); modeDistStatus?.state = ms(m.mode == .distance)
         modeAreaMenu?.state  = ms(m.mode == .area); modeAreaStatus?.state = ms(m.mode == .area)
+        modeCountMenu?.state = ms(m.mode == .count); modeCountStatus?.state = ms(m.mode == .count)
     }
 
     // ---- menu -------------------------------------------------------------
@@ -887,8 +1153,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rulerItem = NSMenuItem(); main.addItem(rulerItem)
         let rulerMenu = NSMenu(title: "Ruler"); rulerItem.submenu = rulerMenu
         modeRulerMenu = rulerMenu.addItem(withTitle: "Mode: Ruler", action: #selector(modeRuler), keyEquivalent: "b")
-        modeDistMenu  = rulerMenu.addItem(withTitle: "Mode: Distance (2 points)", action: #selector(modeDistance), keyEquivalent: "d")
+        modeDistMenu  = rulerMenu.addItem(withTitle: "Mode: Distance (run)", action: #selector(modeDistance), keyEquivalent: "d")
         modeAreaMenu  = rulerMenu.addItem(withTitle: "Mode: Area", action: #selector(modeArea), keyEquivalent: "e")
+        modeCountMenu = rulerMenu.addItem(withTitle: "Mode: Count (tally)", action: #selector(modeCount), keyEquivalent: "")
+        rulerMenu.addItem(.separator())
+        rulerMenu.addItem(withTitle: "Show Takeoff List", action: #selector(showTakeoff), keyEquivalent: "t")
+        rulerMenu.addItem(withTitle: "New Takeoff Set…", action: #selector(newTakeoffSet), keyEquivalent: "n")
+        rulerMenu.addItem(withTitle: "Undo Last Takeoff", action: #selector(undoTakeoff), keyEquivalent: "z")
+        rulerMenu.addItem(withTitle: "Export Takeoff CSV…", action: #selector(exportTakeoffCSV), keyEquivalent: "")
         rulerMenu.addItem(.separator())
         rulerMenu.addItem(withTitle: "Calibrate to Known Dimension…", action: #selector(calibrate), keyEquivalent: "k")
         rulerMenu.addItem(withTitle: "Calibrate Display (once)…", action: #selector(calibrateDisplay), keyEquivalent: "K")

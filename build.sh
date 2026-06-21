@@ -29,12 +29,18 @@ cat > "$OUT/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>DesktopScaleRuler</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSUIElement</key><false/>
 </dict>
 </plist>
 PLIST
+
+# app icon (optional — only if AppIcon.icns is present next to this script)
+if [ -f "$DIR/AppIcon.icns" ]; then
+  cp "$DIR/AppIcon.icns" "$OUT/Contents/Resources/AppIcon.icns"
+fi
 
 swiftc -O -o "$OUT/Contents/MacOS/$APP" "$DIR/main.swift" -framework Cocoa
 

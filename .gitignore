@@ -1,0 +1,22 @@
+# Build output
+DesktopScaleRuler.app/
+*.app/
+*.zip
+build/
+DerivedData/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Xcode user state (in case you open this in Xcode)
+*.xcuserstate
+xcuserdata/
+
+# build binaries (never commit these)
+*.exe
+*.dll
+publish/
+windows/publish/
