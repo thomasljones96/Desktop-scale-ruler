@@ -4,7 +4,7 @@
 
 <h1 align="center">Desktop Scale Ruler</h1>
 
-A floating, always-on-top screen ruler for **macOS and Windows** — in the spirit of [Free Ruler](https://github.com/pascalpp/FreeRuler) — but it reads out **real-world dimensions** so you can measure on-screen PDF plans at scale, and build a running **takeoff** as you go.
+A floating, always-on-top screen ruler for **macOS and Windows** that reads out **real-world dimensions** so you can measure on-screen PDF plans at scale, and build a running **takeoff** as you go.
 
 Built for the people who mark up drawings in Preview rather than open a CAD package: builders, estimators, draftees, renovators, and students.
 
@@ -36,24 +36,10 @@ Built for the people who mark up drawings in Preview rather than open a CAD pack
 
 ## Install
 
-### Download (easiest)
+Grab the latest build from the [Releases](../../releases) page:
 
-1. Grab the latest `DesktopScaleRuler.zip` from the [Releases](../../releases) page and unzip it.
-2. Move `DesktopScaleRuler.app` to your Applications folder.
-3. The app isn't code-signed, so the first time, **right-click it → Open → Open** to get past Gatekeeper. After that it opens normally.
-
-### Build from source
-
-You need Apple's Swift compiler (ships with the Xcode Command Line Tools):
-
-```bash
-xcode-select --install     # once, if you've never installed the dev tools
-git clone https://github.com/thomasljones96/Desktop-scale-ruler.git
-cd Desktop-scale-ruler
-chmod +x build.sh
-./build.sh
-open DesktopScaleRuler.app
-```
+- **macOS** — download `DesktopScaleRuler.zip`, unzip, move `DesktopScaleRuler.app` to Applications. It isn't code-signed, so the first time **right-click it → Open → Open** to get past Gatekeeper. After that it opens normally.
+- **Windows** — download `DesktopScaleRuler.exe` (or the `.zip`) and run it. If SmartScreen warns: **More info → Run anyway**.
 
 ## Using it
 
