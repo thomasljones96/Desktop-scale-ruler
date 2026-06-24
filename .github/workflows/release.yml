@@ -51,18 +51,24 @@ jobs:
       - name: Publish (self-contained single exe)
         run: dotnet publish windows/DesktopScaleRuler.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -o windows/publish
 
-      - name: Zip
-        run: Compress-Archive -Path windows/publish/* -DestinationPath DesktopScaleRuler-Windows.zip
+      - name: Stage exe + zip
+        run: |
+          copy windows\publish\DesktopScaleRuler.exe DesktopScaleRuler.exe
+          Compress-Archive -Path windows/publish/* -DestinationPath DesktopScaleRuler-Windows.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: DesktopScaleRuler-Windows
-          path: DesktopScaleRuler-Windows.zip
+          path: |
+            DesktopScaleRuler.exe
+            DesktopScaleRuler-Windows.zip
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: DesktopScaleRuler-Windows.zip
+          files: |
+            DesktopScaleRuler.exe
+            DesktopScaleRuler-Windows.zip
           generate_release_notes: true

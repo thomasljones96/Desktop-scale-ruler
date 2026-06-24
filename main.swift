@@ -611,6 +611,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startTracking()
         updateCalibLabel()
         syncToggleStates()
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -618,6 +620,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) { saveDefaults() }
 
     private var rulerScreen: NSScreen? { rulerWindow?.screen ?? NSScreen.main }
+
+    // ---- keep windows reachable across display changes --------------------
+
+    /// True if the window's centre sits on some currently-connected screen.
+    private func isReachable(_ frame: NSRect) -> Bool {
+        let c = NSPoint(x: frame.midX, y: frame.midY)
+        return NSScreen.screens.contains { $0.visibleFrame.contains(c) }
+    }
+
+    /// Re-home a frame near the top-left of the main display, keeping its size.
+    private func placeOnMain(_ frame: NSRect) -> NSRect {
+        let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        var f = frame
+        f.size.width = min(f.size.width, vf.width - 80)
+        f.size.height = min(f.size.height, vf.height - 80)
+        f.origin = NSPoint(x: vf.minX + 80, y: vf.maxY - f.size.height - 100)
+        return f
+    }
+
+    @objc private func screensChanged() {
+        guard rulerWindow != nil, overlayWindow != nil else { return }
+        // resize the full-screen overlay to the new display layout
+        var union = NSRect.zero
+        for s in NSScreen.screens { union = (union == .zero) ? s.frame : union.union(s.frame) }
+        if union != .zero {
+            overlayWindow.setFrame(union, display: false)
+            overlayView.frame = NSRect(origin: .zero, size: union.size)
+            overlayView.originOffset = union.origin
+        }
+        // bring the ruler back onto a visible screen if it's stranded
+        if collapsed {
+            if !isReachable(savedFrame) { savedFrame = placeOnMain(savedFrame) }
+            if !isReachable(rulerWindow.frame) { rulerWindow.setFrame(placeOnMain(rulerWindow.frame), display: true) }
+        } else if !isReachable(rulerWindow.frame) {
+            rulerWindow.setFrame(placeOnMain(rulerWindow.frame), display: true)
+            saveDefaults()
+        }
+        overlayView.needsDisplay = true
+    }
 
     private func applyDefaultScale() {
         RulerModel.shared.mmPerPoint = 100 * physMMPerPoint(for: rulerScreen)
@@ -665,6 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildRuler() {
         var frame = NSRect(x: 240, y: 420, width: 620, height: 56)
         if let f = pendingFrame { frame = f }
+        if !isReachable(frame) { frame = placeOnMain(frame) }   // saved spot on a now-disconnected display? bring it home
         rulerWindow = RulerPanel(contentRect: frame,
                                  styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)

@@ -654,6 +654,42 @@ namespace DesktopScaleRuler
             catch { return phys; }
         }
 
+        // ---- keep windows reachable across display changes ----
+        static bool IsReachable(double left, double top, double w, double h)
+        {
+            double cx = left + w / 2, cy = top + h / 2;
+            double vx = SystemParameters.VirtualScreenLeft, vy = SystemParameters.VirtualScreenTop;
+            double vw = SystemParameters.VirtualScreenWidth, vh = SystemParameters.VirtualScreenHeight;
+            return cx >= vx && cx <= vx + vw && cy >= vy && cy <= vy + vh;
+        }
+
+        static Rect PlaceOnPrimary(double w, double h)
+        {
+            var wa = SystemParameters.WorkArea;             // primary monitor, DIU
+            double nw = Math.Min(w, wa.Width - 80), nh = Math.Min(h, wa.Height - 80);
+            return new Rect(wa.Left + 80, wa.Top + 80, nw, nh);
+        }
+
+        void OnDisplaysChanged()
+        {
+            if (_overlay == null || _ruler == null) return;
+            // overlay follows the new virtual-screen bounds
+            _overlay.Left = SystemParameters.VirtualScreenLeft;
+            _overlay.Top = SystemParameters.VirtualScreenTop;
+            _overlay.Width = SystemParameters.VirtualScreenWidth;
+            _overlay.Height = SystemParameters.VirtualScreenHeight;
+            // re-home the ruler if it's stranded on a disconnected display
+            if (!IsReachable(_ruler.Left, _ruler.Top, _ruler.Width, _ruler.Height))
+            {
+                var r = PlaceOnPrimary(_ruler.Width, _ruler.Height);
+                _ruler.Left = r.Left; _ruler.Top = r.Top; _ruler.Width = r.Width; _ruler.Height = r.Height;
+                Save();
+            }
+            if (_collapsed && !IsReachable(_savedRect.Left, _savedRect.Top, _savedRect.Width, _savedRect.Height))
+                _savedRect = PlaceOnPrimary(_savedRect.Width, _savedRect.Height);
+            _ov.InvalidateVisual();
+        }
+
         public void Start()
         {
             _s = Settings.Load();
@@ -686,6 +722,9 @@ namespace DesktopScaleRuler
             };
             _timer.Start();
 
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += (s, e) =>
+                System.Windows.Application.Current.Dispatcher.Invoke(OnDisplaysChanged);
+
             SyncMenu();
         }
 
@@ -702,6 +741,11 @@ namespace DesktopScaleRuler
                 Left = _s.Left, Top = _s.Top, Width = _s.Width, Height = _s.Height,
                 Title = "Desktop Scale Ruler"
             };
+            if (!IsReachable(_ruler.Left, _ruler.Top, _ruler.Width, _ruler.Height))
+            {
+                var r = PlaceOnPrimary(_ruler.Width, _ruler.Height);
+                _ruler.Left = r.Left; _ruler.Top = r.Top; _ruler.Width = r.Width; _ruler.Height = r.Height;
+            }
             _rv = new RulerElement { Win = _ruler, Vertical = _s.Vertical };
             _rv.OnDoubleClick = ToggleCollapse;
             _rv.OnGeometryChanged = () => _ov.InvalidateVisual();          // live drag: repaint only
