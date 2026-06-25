@@ -422,6 +422,7 @@ namespace DesktopScaleRuler
         public bool AreaClosed = false;
         public List<Point> CountMarkers = new List<Point>();
         public Action OnExitRequested;   // right-click / Esc leaves measure mode
+        public Action OnCycleRequested;  // Tab rotates to the next mode
 
         static readonly Typeface Face = new Typeface("Segoe UI");
         static FormattedText FT(string s, double size, Brush brush) =>
@@ -463,14 +464,17 @@ namespace DesktopScaleRuler
             Pts.Clear(); AreaClosed = false;
         }
 
-        public void HandleKey(Key k)
+        public bool HandleKey(Key k)
         {
             if (k == Key.Escape)
             {
-                if (Pts.Count > 0) { Pts.Clear(); AreaClosed = false; InvalidateVisual(); }
+                if (Pts.Count > 0 || CountMarkers.Count > 0) { Pts.Clear(); AreaClosed = false; CountMarkers.Clear(); InvalidateVisual(); }
                 else OnExitRequested?.Invoke();
+                return true;
             }
-            else if ((k == Key.Enter || k == Key.Return) && Model.Mode == 2 && Pts.Count >= 3) { CommitArea(); InvalidateVisual(); }
+            if (k == Key.Tab) { OnCycleRequested?.Invoke(); return true; }
+            if ((k == Key.Enter || k == Key.Return) && Model.Mode == 2 && Pts.Count >= 3) { CommitArea(); InvalidateVisual(); return true; }
+            return false;
         }
 
         protected override void OnMouseRightButtonDown(MouseButtonEventArgs e)
@@ -568,7 +572,7 @@ namespace DesktopScaleRuler
         void DrawDistance(DrawingContext dc)
         {
             var red = Color.FromArgb(242, 217, 26, 26);
-            if (Pts.Count == 0) { Label(dc, "Click two points to measure each length", ToLocal(CursorScreen), red); return; }
+            if (Pts.Count == 0) { Label(dc, "Click two points to measure  ·  Tab cycles  ·  Esc / right-click exits", ToLocal(CursorScreen), red); return; }
             var a = Pts[Pts.Count - 1];
             var av = ToLocal(a); var bv = ToLocal(CursorScreen);
             dc.DrawLine(new Pen(new SolidColorBrush(red), 1.5), av, bv);
@@ -580,7 +584,7 @@ namespace DesktopScaleRuler
         void DrawCount(DrawingContext dc)
         {
             var purple = Color.FromArgb(242, 140, 38, 184);
-            if (CountMarkers.Count == 0) Label(dc, "Click to count items into “" + Takeoff.ActiveSet + "”", ToLocal(CursorScreen), purple);
+            if (CountMarkers.Count == 0) Label(dc, "Click to count into “" + Takeoff.ActiveSet + "”  ·  Tab cycles  ·  Esc / right-click exits", ToLocal(CursorScreen), purple);
             var fill = new SolidColorBrush(purple);
             for (int i = 0; i < CountMarkers.Count; i++)
             {
@@ -594,7 +598,7 @@ namespace DesktopScaleRuler
         void DrawArea(DrawingContext dc)
         {
             var blue = Color.FromArgb(242, 26, 115, 230);
-            if (Pts.Count == 0) { Label(dc, "Click corners; double-click or Enter to close", ToLocal(CursorScreen), blue); return; }
+            if (Pts.Count == 0) { Label(dc, "Click corners; double-click/Enter to close  ·  Tab cycles  ·  Esc / right-click exits", ToLocal(CursorScreen), blue); return; }
             var verts = new List<Point>(Pts);
             if (!AreaClosed) verts.Add(CursorScreen);
             var vv = verts.Select(ToLocal).ToList();
@@ -774,9 +778,10 @@ namespace DesktopScaleRuler
             };
             _ov = new OverlayElement { OverlayWin = _overlay, RulerWin = _ruler, Ruler = _rv, CursorScreen = Native.CursorScreen() };
             _ov.OnExitRequested = () => SetMode(0);
+            _ov.OnCycleRequested = () => CycleMode();
             _overlay.Content = _ov;
             _overlay.SourceInitialized += (s, e) => Native.SetClickThrough(_overlay, true); // click-through in ruler mode
-            _overlay.KeyDown += (s, e) => _ov.HandleKey(e.Key);
+            _overlay.KeyDown += (s, e) => { if (_ov.HandleKey(e.Key)) e.Handled = true; };
             _overlay.Show();
         }
 
@@ -973,6 +978,8 @@ namespace DesktopScaleRuler
             }
             _rv.InvalidateVisual(); _ov.InvalidateVisual(); SyncMenu();
         }
+
+        void CycleMode() { SetMode((Model.Mode + 1) % 4); }   // ruler→distance→area→count→ruler
 
         void SetMode(int mode)
         {

@@ -354,6 +354,8 @@ final class OverlayView: NSView {
     var pts: [NSPoint] = []          // screen-coord points for distance/area
     var areaClosed = false
     var countMarkers: [NSPoint] = [] // screen-coord markers for count mode
+    var onExit: (() -> Void)?        // leave measure mode → back to ruler
+    var onCycle: (() -> Void)?       // rotate to the next measure mode
 
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
@@ -394,11 +396,19 @@ final class OverlayView: NSView {
 
     override func keyDown(with e: NSEvent) {
         switch e.keyCode {
-        case 53: pts.removeAll(); needsDisplay = true                                   // Esc: end run / clear polygon
+        case 53:                                                                        // Esc: clear current, else exit to ruler
+            if !pts.isEmpty || !countMarkers.isEmpty { pts.removeAll(); countMarkers.removeAll(); needsDisplay = true }
+            else { onExit?() }
+        case 48:                                                                        // Tab: cycle modes
+            onCycle?()
         case 36, 76:                                                                    // Return/Enter: close + commit area
             if RulerModel.shared.mode == .area && pts.count >= 3 { commitArea(); needsDisplay = true }
         default: super.keyDown(with: e)
         }
+    }
+
+    override func rightMouseDown(with e: NSEvent) {
+        if RulerModel.shared.mode != .ruler { onExit?() } else { super.rightMouseDown(with: e) }
     }
 
     private func commitArea() {
@@ -503,7 +513,7 @@ final class OverlayView: NSView {
     private func drawDistance() {
         let red = NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.1, alpha: 0.95)
         guard let a = pts.last else {
-            label("Click two points to measure each length", at: toView(cursorScreen), color: red)
+            label("Click two points to measure  ·  Tab cycles  ·  Esc / right-click exits", at: toView(cursorScreen), color: red)
             return
         }
         red.setStroke()
@@ -518,7 +528,7 @@ final class OverlayView: NSView {
     private func drawCount() {
         let purple = NSColor(calibratedRed: 0.55, green: 0.15, blue: 0.72, alpha: 0.95)
         if countMarkers.isEmpty {
-            label("Click to count items into “\(TakeoffStore.shared.activeSet)”", at: toView(cursorScreen), color: purple)
+            label("Click to count into “\(TakeoffStore.shared.activeSet)”  ·  Tab cycles  ·  Esc / right-click exits", at: toView(cursorScreen), color: purple)
         }
         for (i, m) in countMarkers.enumerated() {
             let v = toView(m)
@@ -533,7 +543,7 @@ final class OverlayView: NSView {
 
     private func drawArea() {
         guard !pts.isEmpty else {
-            label("Click corners; double-click or Enter to close", at: toView(cursorScreen),
+            label("Click corners; double-click/Enter to close  ·  Tab cycles  ·  Esc / right-click exits", at: toView(cursorScreen),
                   color: NSColor(calibratedRed: 0.1, green: 0.4, blue: 0.85, alpha: 0.9))
             return
         }
@@ -743,6 +753,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayView.rulerView = rulerView
         overlayView.originOffset = union.origin
         overlayView.cursorScreen = NSEvent.mouseLocation
+        overlayView.onExit = { [weak self] in self?.setMode(.ruler) }
+        overlayView.onCycle = { [weak self] in self?.cycleMode() }
         overlayWindow.contentView = overlayView
         overlayWindow.orderFront(nil)
     }
@@ -1147,6 +1159,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func modeArea() { setMode(.area) }
     @objc private func modeCount() { setMode(.count) }
 
+    @objc private func cycleMode() {
+        let next: MeasureMode
+        switch RulerModel.shared.mode {
+        case .ruler: next = .distance
+        case .distance: next = .area
+        case .area: next = .count
+        case .count: next = .ruler
+        }
+        setMode(next)
+    }
+
     @objc private func copyMeasurement() {
         let m = RulerModel.shared
         var text = ""
@@ -1198,6 +1221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         modeDistMenu  = rulerMenu.addItem(withTitle: "Mode: Distance (run)", action: #selector(modeDistance), keyEquivalent: "d")
         modeAreaMenu  = rulerMenu.addItem(withTitle: "Mode: Area", action: #selector(modeArea), keyEquivalent: "e")
         modeCountMenu = rulerMenu.addItem(withTitle: "Mode: Count (tally)", action: #selector(modeCount), keyEquivalent: "")
+        rulerMenu.addItem(withTitle: "Cycle Mode (Tab) — Esc / right-click exits", action: #selector(cycleMode), keyEquivalent: "")
         rulerMenu.addItem(.separator())
         rulerMenu.addItem(withTitle: "Show Takeoff List", action: #selector(showTakeoff), keyEquivalent: "t")
         rulerMenu.addItem(withTitle: "New Takeoff Set…", action: #selector(newTakeoffSet), keyEquivalent: "n")
